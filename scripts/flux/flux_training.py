@@ -100,6 +100,7 @@ def flux_training() -> run.Partial:
                     check_for_nan_in_grad=True,
                     grad_reduce_in_fp32=True,
                 ),
+                fsdp='megatron',
             ),
             plugins=nl.MegatronMixedPrecision(precision="bf16-mixed"),
             num_sanity_val_steps=0,

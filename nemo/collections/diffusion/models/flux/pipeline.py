@@ -26,6 +26,7 @@ from tqdm import tqdm
 from nemo.collections.diffusion.encoders.conditioner import FrozenCLIPEmbedder, FrozenT5Embedder
 from nemo.collections.diffusion.models.flux.model import Flux
 from nemo.collections.diffusion.models.flux_controlnet.model import FluxControlNet, FluxControlNetConfig
+from nemo.collections.diffusion.models.flux_brushnet.model import FluxBrushNet, FluxBrushNetConfig
 from nemo.collections.diffusion.sampler.flow_matching.flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from nemo.collections.diffusion.utils.flux_ckpt_converter import flux_transformer_converter
 from nemo.collections.diffusion.utils.flux_pipeline_utils import FluxModelParams
@@ -238,7 +239,7 @@ class FluxInferencePipeline(nn.Module):
             batch_size = prompt_embeds.shape[0]
         else:
             raise ValueError("Either prompt or prompt_embeds must be provided.")
-        if device == 'cuda' and self.t5_encoder.device != device:
+        if device == 'cuda' and self.t5_encoder is not None and self.t5_encoder.device != device:
             self.t5_encoder.to(device)
         if prompt_embeds is None:
             prompt_embeds = self.t5_encoder(prompt, max_sequence_length=max_sequence_length)
@@ -246,7 +247,7 @@ class FluxInferencePipeline(nn.Module):
         prompt_embeds = prompt_embeds.repeat(1, num_images_per_prompt, 1)
         prompt_embeds = prompt_embeds.view(batch_size * num_images_per_prompt, seq_len, -1).to(dtype=dtype)
 
-        if device == 'cuda' and self.clip_encoder.device != device:
+        if device == 'cuda' and self.clip_encoder is not None and self.clip_encoder.device != device:
             self.clip_encoder.to(device)
         if pooled_prompt_embeds is None:
             _, pooled_prompt_embeds = self.clip_encoder(prompt)
@@ -558,7 +559,7 @@ class FluxInferencePipeline(nn.Module):
             prompt = [prompt]
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
-        elif prompt_embeds is not None and isinstance(prompt_embeds, torch.FloatTensor):
+        elif prompt_embeds is not None and isinstance(prompt_embeds, torch.Tensor):
             batch_size = prompt_embeds.shape[0]
         else:
             raise ValueError("Either prompt or prompt_embeds must be provided.")
@@ -958,6 +959,414 @@ class FluxControlNetInferencePipeline(FluxInferencePipeline):
                     controlnet_double_block_samples, controlnet_single_block_samples = self.flux_controlnet(
                         img=latents,
                         controlnet_cond=control_image,
+                        txt=prompt_embeds,
+                        y=pooled_prompt_embeds,
+                        timesteps=timestep / 1000,
+                        img_ids=latent_image_ids,
+                        txt_ids=text_ids,
+                        guidance=guidance,
+                        conditioning_scale=conditioning_scale,
+                    )
+                    pred = self.transformer(
+                        img=latents,
+                        txt=prompt_embeds,
+                        y=pooled_prompt_embeds,
+                        timesteps=timestep / 1000,
+                        img_ids=latent_image_ids,
+                        txt_ids=text_ids,
+                        guidance=guidance,
+                        controlnet_double_block_samples=controlnet_double_block_samples,
+                        controlnet_single_block_samples=controlnet_single_block_samples,
+                    )
+                    latents = self.scheduler.step(pred, t, latents)[0]
+            if offload:
+                self.transformer.to('cpu')
+                torch.cuda.empty_cache()
+
+            if output_type == "latent":
+                return latents.transpose(0, 1)
+            elif output_type == "pil":
+                latents = self._unpack_latents(latents.transpose(0, 1), height, width, self.vae_scale_factor)
+                if device == 'cuda' and device != self.device:
+                    self.vae.to(device)
+                with torch.autocast(device_type='cuda', dtype=latents.dtype):
+                    image = self.vae.decode(latents)
+                if offload:
+                    self.vae.to('cpu')
+                    torch.cuda.empty_cache()
+                image = FluxInferencePipeline.denormalize(image)
+                image = FluxInferencePipeline.torch_to_numpy(image)
+                image = FluxInferencePipeline.numpy_to_pil(image)
+        if save_to_disk:
+            print('Saving to disk')
+            assert len(image) == int(len(prompt) * num_images_per_prompt)
+            prompt = [p[:40] + f'_{idx}' for p in prompt for idx in range(num_images_per_prompt)]
+            for file_name, image in zip(prompt, image):
+                image.save(f'{file_name}.png')
+
+        return image
+
+
+class FluxBrushNetInferencePipeline(FluxInferencePipeline):
+    def __init__(
+        self,
+        params: Optional[FluxModelParams] = None,
+        brushnet_config: Optional[FluxBrushNetConfig] = None,
+        flux: Flux = None,
+        vae: AutoEncoder = None,
+        t5: FrozenT5Embedder = None,
+        clip: FrozenCLIPEmbedder = None,
+        scheduler_steps: int = 1000,
+        flux_brushnet: FluxBrushNet = None,
+    ):
+        '''
+        Flux Brushnet inference pipeline initializes brushnet component in addition to a normal flux pipeline.
+        '''
+        super().__init__(
+            params,
+            flux,
+            vae,
+            t5,
+            clip,
+            scheduler_steps,
+        )
+        self.flux_brushnet = FluxBrushNet(brushnet_config) if flux_brushnet is None else flux_brushnet
+
+    def load_from_pretrained(
+        self, flux_ckpt_path, controlnet_ckpt_path, do_convert_from_hf=True, save_converted_model_to=None
+    ):
+        '''
+        Converts both flux base model and flux controlnet ckpt into NeMo format.
+        '''
+        if do_convert_from_hf:
+            flux_ckpt = flux_transformer_converter(flux_ckpt_path, self.transformer.config)
+            flux_controlnet_ckpt = flux_transformer_converter(controlnet_ckpt_path, self.flux_brushnet.config)
+
+            if save_converted_model_to is not None:
+                save_path = os.path.join(save_converted_model_to, 'nemo_flux_transformer.safetensors')
+                save_safetensors(flux_ckpt, save_path)
+                logging.info(f'saving converted transformer checkpoint to {save_path}')
+                save_path = os.path.join(save_converted_model_to, 'nemo_flux_controlnet_transformer.safetensors')
+                save_safetensors(flux_controlnet_ckpt, save_path)
+                logging.info(f'saving converted transformer checkpoint to {save_path}')
+        else:
+            flux_ckpt = load_safetensors(flux_ckpt_path)
+            flux_controlnet_ckpt = load_safetensors(controlnet_ckpt_path)
+        missing, unexpected = self.transformer.load_state_dict(flux_ckpt, strict=False)
+        missing = [k for k in missing if not k.endswith('_extra_state')]
+        # These keys are mcore specific and should not affect the model performance
+        if len(missing) > 0:
+            logging.info(
+                f"The following keys are missing during flux checkpoint loading, "
+                f"please check the ckpt provided or the image quality may be compromised.\n {missing}"
+            )
+            logging.info(f"Found unexepected keys: \n {unexpected}")
+
+        missing, unexpected = self.flux_brushnet.load_state_dict(flux_controlnet_ckpt, strict=False)
+        missing = [k for k in missing if not k.endswith('_extra_state')]
+        # These keys are mcore specific and should not affect the model performance
+        if len(missing) > 0:
+            logging.info(
+                f"The following keys are missing during controlnet checkpoint loading, "
+                f"please check the ckpt provided or the image quality may be compromised.\n {missing}"
+            )
+            logging.info(f"Found unexepected keys: \n {unexpected}")
+
+    def pil_to_numpy(self, images):
+        '''
+        PIL image to numpy array
+        '''
+        if not isinstance(images, list):
+            images = [images]
+        images = [np.array(image).astype(np.float32) / 255.0 for image in images]
+        images = np.stack(images, axis=0)
+
+        return images
+
+    def numpy_to_pt(self, images: np.ndarray) -> torch.Tensor:
+        '''
+        Convert numpy image into torch tensors
+        '''
+        if images.ndim == 3:
+            images = images[..., None]
+
+        images = torch.from_numpy(images.transpose(0, 3, 1, 2))
+        return images
+
+    def prepare_image(
+        self,
+        images,
+        height,
+        width,
+        batch_size,
+        num_images_per_prompt,
+        device,
+        dtype,
+    ):
+        '''
+        Preprocess image into torch tensor, also duplicate by batch size.
+        '''
+        if isinstance(images, torch.Tensor):
+            pass
+        else:
+            orig_height, orig_width = images[0].height, images[0].width
+            if height != orig_height or width != orig_width:
+                images = [image.resize((width, height), resample=3) for image in images]
+
+            images = self.pil_to_numpy(images)
+            images = self.numpy_to_pt(images)
+        image_batch_size = images.shape[0]
+        if image_batch_size == 1:
+            repeat_by = batch_size
+        else:
+            repeat_by = num_images_per_prompt
+        images = images.repeat_interleave(repeat_by, dim=0)
+
+        images = images.to(device=device, dtype=dtype)
+
+        return images
+
+    def prepare_mask_latents(self, control_image, masked_image, batch_size, num_channels_latents, num_images_per_prompt, height, width, dtype, device):
+        # 1. calculate the height and width of the latents
+        # VAE applies 8x compression on images but we must also account for packing which requires
+        # latent height and width to be divisible by 2.
+        height = 2 * int(height) // self.vae_scale_factor
+        width = 2 * int(width) // self.vae_scale_factor
+
+        if device == 'cuda' and self.device != device:
+            self.vae.to(device)
+        with torch.no_grad():
+            masked_image_latents = self.vae.encode(masked_image).to(dtype=dtype)
+
+        # height_masked_image_latents, width_masked_image_latents = masked_image_latents.shape[2:]
+        masked_image_latents = self._pack_latents(
+            masked_image_latents,
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+        ).transpose(0, 1)
+
+        # 5.resize mask to latents shape we we concatenate the mask to the latents
+        mask = control_image[:, 0, :, :]  # batch_size, 8 * height, 8 * width (mask has not been 8x compressed)
+        mask = mask.view(
+            batch_size, height, self.vae_scale_factor // 2, width, self.vae_scale_factor // 2
+        )  # batch_size, height, 8, width, 8
+        mask = mask.permute(0, 2, 4, 1, 3)  # batch_size, 8, 8, height, width
+        mask = mask.reshape(
+            batch_size, self.vae_scale_factor // 2 * self.vae_scale_factor // 2, height, width
+        )  # batch_size, 8*8, height, width
+
+        # 6. pack the mask:
+        # batch_size, 64, height, width -> batch_size, height//2 * width//2 , 64*2*2
+        mask = self._pack_latents(
+            mask,
+            batch_size * num_images_per_prompt,
+            self.vae_scale_factor // 2 * self.vae_scale_factor // 2,
+            height,
+            width,
+        )
+
+        return mask, masked_image_latents
+
+    def __call__(
+        self,
+        prompt: Union[str, List[str]] = None,
+        image: Union[Image.Image, torch.FloatTensor] = None,
+        height: Optional[int] = 1024,
+        width: Optional[int] = 1024,
+        num_inference_steps: int = 30,
+        timesteps: Optional[List[int]] = None,
+        guidance_scale: float = 3.5,
+        num_images_per_prompt: Optional[int] = 1,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        prompt_embeds: Optional[torch.FloatTensor] = None,
+        pooled_prompt_embeds: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        max_sequence_length: int = 512,
+        device: torch.device = 'cuda',
+        dtype: torch.dtype = torch.float32,
+        save_to_disk: bool = True,
+        offload: bool = False,
+        control_guidance_start: float = 0.0,
+        control_guidance_end: float = 1.0,
+        control_image: Union[Image.Image, torch.FloatTensor] = None,
+        controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
+    ):
+        """
+        Generates images based on a given text prompt and optionally incorporates control images and ControlNet for
+        guidance.
+
+        This method generates images by embedding the prompt, preparing the latent vectors, iterating through timesteps
+        in the diffusion process, and then decoding the latent representation back into an image. The method supports
+        control images through ControlNet, where the `control_image` is used to condition the image generation.
+        It also allows you to specify custom guidance scales and other parameters. Generated images can be saved to disk if requested.
+
+        Args:
+            prompt (Union[str, List[str]]):
+                A text prompt or a list of text prompts to guide image generation. Each prompt generates one or more
+                images based on the `num_images_per_prompt`.
+            image (Union[Image.Image, torch.FloatTensor]):
+                Input image.
+            height (Optional[int]):
+                The height of the output image. Default is 512.
+            width (Optional[int]):
+                The width of the output image. Default is 512.
+            num_inference_steps (int):
+                The number of steps for the diffusion process. Default is 28.
+            timesteps (Optional[List[int]]):
+                A list of specific timesteps for the diffusion process. If not provided, they are automatically
+                calculated.
+            guidance_scale (float):
+                The scale of the guidance signal, typically used to control the strength of prompt conditioning.
+            num_images_per_prompt (Optional[int]):
+                The number of images to generate per prompt. Default is 1.
+            generator (Optional[Union[torch.Generator, List[torch.Generator]]]):
+                A random number generator or a list of generators for generating latents. If a list is provided,
+                it should match the batch size.
+            latents (Optional[torch.FloatTensor]):
+                Pre-existing latents to use instead of generating new ones.
+            prompt_embeds (Optional[torch.FloatTensor]):
+                Optionally pre-computed prompt embeddings to skip the prompt encoding step.
+            pooled_prompt_embeds (Optional[torch.FloatTensor]):
+                Optionally pre-computed pooled prompt embeddings.
+            output_type (Optional[str]):
+                The format of the output. Can be "latent" or "pil" (PIL image). Default is "pil".
+            max_sequence_length (int):
+                The maximum sequence length for tokenizing the prompt. Default is 512.
+            device (torch.device):
+                The device on which the computation should take place (e.g., 'cuda'). Default is 'cuda'.
+            dtype (torch.dtype):
+                The data type of the latents and model weights. Default is `torch.float32`.
+            save_to_disk (bool):
+                Whether or not to save the generated images to disk. Default is True.
+            offload (bool):
+                Whether or not to offload model components to CPU to free up GPU memory during the process. Default is False.
+            control_guidance_start (float):
+                The start point for control guidance to apply during the diffusion process.
+            control_guidance_end (float):
+                The end point for control guidance to apply during the diffusion process.
+            control_image (Union[Image.Image, torch.FloatTensor]):
+                The image used for conditioning the generation process via ControlNet.
+            controlnet_conditioning_scale (Union[float, List[float]]):
+                Scaling factors to control the impact of the control image in the generation process.
+                Can be a single value or a list for multiple images.
+
+        Returns:
+            Union[List[Image.Image], torch.Tensor]:
+                The generated images or latents, depending on the `output_type` argument.
+                If `output_type` is "pil", a list of PIL images is returned. If "latent", the latents are returned.
+
+        Raises:
+            ValueError: If neither a `prompt` nor `prompt_embeds` is provided.
+
+        Notes:
+            - The model expects a device of 'cuda'.
+              The method will raise an assertion error if a different device is provided.
+            - The method supports conditional image generation using ControlNet, where a `control_image` can guide the
+              generation process.
+            - If `save_to_disk` is enabled, images will be saved with a filename derived from the prompt text.
+        """
+        assert device == 'cuda', 'Transformer blocks in Mcore must run on cuda devices'
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+            prompt = [prompt]
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        elif prompt_embeds is not None and isinstance(prompt_embeds, torch.Tensor):
+            batch_size = prompt_embeds.shape[0]
+        else:
+            raise ValueError("Either prompt or prompt_embeds must be provided.")
+
+        ## get text prompt embeddings
+        prompt_embeds, pooled_prompt_embeds, text_ids = self.encoder_prompt(
+            prompt=prompt,
+            prompt_embeds=prompt_embeds,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            num_images_per_prompt=num_images_per_prompt,
+            max_sequence_length=max_sequence_length,
+            device=device,
+            dtype=dtype,
+        )
+        if offload:
+            self.t5_encoder.to('cpu')
+            self.clip_encoder.to('cpu')
+            torch.cuda.empty_cache()
+
+        ## prepare image latents
+        num_channels_latents = self.transformer.in_channels // 4
+        latents, latent_image_ids = self.prepare_latents(
+            batch_size * num_images_per_prompt, num_channels_latents, height, width, dtype, device, generator, latents
+        )
+
+        # prepare timesteps
+        sigmas = np.linspace(1.0, 1 / num_inference_steps, num_inference_steps)
+        image_seq_len = latents.shape[0]
+
+        mu = FluxInferencePipeline._calculate_shift(
+            image_seq_len,
+            self.scheduler.base_image_seq_len,
+            self.scheduler.max_image_seq_len,
+            self.scheduler.base_shift,
+            self.scheduler.max_shift,
+        )
+
+        self.scheduler.set_timesteps(sigmas=sigmas, device=device, mu=mu)
+        timesteps = self.scheduler.timesteps
+
+        image = self.prepare_image(
+            images=image,
+            height=height,
+            width=width,
+            batch_size=batch_size * num_images_per_prompt,
+            num_images_per_prompt=num_images_per_prompt,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        control_image = self.prepare_image(
+            images=control_image,
+            height=height,
+            width=width,
+            batch_size=batch_size * num_images_per_prompt,
+            num_images_per_prompt=num_images_per_prompt,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        masked_image = image.clone()
+        masked_image[control_image.repeat(1, masked_image.shape[1], 1, 1) >= 0.5] = -1.0 # set outside of object region to -1
+
+        height, width = control_image.shape[-2:]
+        mask, masked_image_latents = self.prepare_mask_latents(control_image, masked_image, batch_size, num_channels_latents, num_images_per_prompt,height, width, dtype, device)
+
+        brushnet_cond = torch.cat([masked_image_latents, mask], dim=2)
+
+        controlnet_keep = []
+        for i in range(len(timesteps)):
+            controlnet_keep.append(
+                1.0
+                - float(i / len(timesteps) < control_guidance_start or (i + 1) / len(timesteps) > control_guidance_end)
+            )
+        if device == 'cuda' and device != self.device:
+            self.transformer.to(device)
+            self.flux_brushnet.to(device)
+        with torch.no_grad():
+            for i, t in tqdm(enumerate(timesteps)):
+                timestep = t.expand(latents.shape[1]).to(device=latents.device, dtype=latents.dtype)
+                if self.transformer.guidance_embed:
+                    guidance = torch.tensor([guidance_scale], device=device).expand(latents.shape[1])
+                else:
+                    guidance = None
+
+                conditioning_scale = controlnet_keep[i] * controlnet_conditioning_scale
+
+                with torch.autocast(device_type='cuda', dtype=latents.dtype):
+                    controlnet_double_block_samples, controlnet_single_block_samples = self.flux_brushnet(
+                        img=latents,
+                        brushnet_cond=brushnet_cond,
                         txt=prompt_embeds,
                         y=pooled_prompt_embeds,
                         timesteps=timestep / 1000,

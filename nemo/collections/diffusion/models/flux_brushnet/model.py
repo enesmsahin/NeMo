@@ -30,7 +30,6 @@ from nemo.collections.diffusion.models.dit.dit_layer_spec import (
 )
 from nemo.collections.diffusion.models.flux.layers import EmbedND, MLPEmbedder, TimeStepEmbedder
 from nemo.collections.diffusion.models.flux.model import FluxConfig, FluxModelParams, MegatronFluxModel
-from nemo.collections.diffusion.models.flux_controlnet.layers import ControlNetConditioningEmbedding
 from nemo.lightning import io
 from nemo.utils import logging
 
@@ -71,7 +70,7 @@ def flux_controlnet_data_step(dataloader_iter):
 
 
 @dataclass
-class FluxControlNetConfig(TransformerConfig, io.IOMixin):
+class FluxBrushNetConfig(TransformerConfig, io.IOMixin):
     '''
     Flux config inherits from TransformerConfig class.
     '''
@@ -88,7 +87,7 @@ class FluxControlNetConfig(TransformerConfig, io.IOMixin):
     guidance_embed: bool = True
     num_mode: int = None
     model_channels: int = 256
-    conditioning_embedding_channels: int = None
+    num_bn_mask_channels: int = 256
     rotary_interleaved: bool = True
     layernorm_epsilon: float = 1e-06
     hidden_dropout: float = 0
@@ -102,23 +101,23 @@ class FluxControlNetConfig(TransformerConfig, io.IOMixin):
     data_step_fn: Callable = flux_controlnet_data_step
 
 
-class FluxControlNet(VisionModule):
+class FluxBrushNet(VisionModule):
     """
     A VisionModule-based neural network designed for Flux ControlNet tasks.
 
 
     Args:
-        config (FluxControlNetConfig):
+        config (FluxBrushNetConfig):
         Configuration object containing model parameters such as input channels, hidden size, patch size,
             and number of transformer layers.
     """
 
-    def __init__(self, config: FluxControlNetConfig):
+    def __init__(self, config: FluxBrushNetConfig):
         """
-        Initializes the FluxControlNet model with embeddings, transformer layers, and optional conditioning blocks.
+        Initializes the FluxBrushNet model with embeddings, transformer layers, and optional conditioning blocks.
 
         Args:
-            config (FluxControlNetConfig): Configuration object with model parameters.
+            config (FluxBrushNetConfig): Configuration object with model parameters.
         """
         super().__init__(config)
         self.out_channels = config.in_channels
@@ -126,7 +125,7 @@ class FluxControlNet(VisionModule):
         self.patch_size = config.patch_size
 
         self.pos_embed = EmbedND(dim=self.hidden_size, theta=10000, axes_dim=[16, 56, 56])
-        self.img_embed = nn.Linear(config.in_channels, self.hidden_size)
+        self.img_embed = nn.Linear(config.in_channels * 2 + config.num_bn_mask_channels, self.hidden_size) # noisy_latents + masked_image_latents + mask_latents
         self.txt_embed = nn.Linear(config.context_dim, self.hidden_size)
         self.timestep_embedding = TimeStepEmbedder(config.model_channels, self.hidden_size)
         self.vector_embedding = MLPEmbedder(in_dim=config.vec_in_dim, hidden_dim=self.hidden_size)
@@ -188,36 +187,33 @@ class FluxControlNet(VisionModule):
                 )
             )
 
-        if config.conditioning_embedding_channels is not None:
-            self.input_hint_block = ControlNetConditioningEmbedding(
-                conditioning_embedding_channels=config.conditioning_embedding_channels,
-                block_out_channels=(16, 16, 16, 16),
-            )
-            self.controlnet_x_embedder = torch.nn.Linear(config.in_channels, self.hidden_size)
-        else:
-            self.input_hint_block = None
-            self.controlnet_x_embedder = zero_module(torch.nn.Linear(config.in_channels, self.hidden_size))
-
     def load_from_flux_transformer(self, flux):
         """
-        Loads pre-trained weights from a Flux Transformer model into the FluxControlNet.
+        Loads pre-trained weights from a Flux Transformer model into the FluxBrushNet.
 
         Args:
             flux (FluxTransformer): A pre-trained Flux Transformer model.
         """
         logging.info("Loading ControlNet layer weights from Flux...")
         self.pos_embed.load_state_dict(flux.pos_embed.state_dict())
-        self.img_embed.load_state_dict(flux.img_embed.state_dict())
         self.txt_embed.load_state_dict(flux.txt_embed.state_dict())
         self.timestep_embedding.load_state_dict(flux.timestep_embedding.state_dict())
         self.vector_embedding.load_state_dict(flux.vector_embedding.state_dict())
         self.double_blocks.load_state_dict(flux.double_blocks.state_dict(), strict=False)
         self.single_blocks.load_state_dict(flux.single_blocks.state_dict(), strict=False)
 
+        # Noise latents and masked image latents are initialized from the transformer
+        # Mask latents are initialized with zeros
+        img_embed_weight = torch.zeros_like(self.img_embed.weight)
+        img_embed_weight[:, :self.out_channels] = flux.img_embed.weight.clone()
+        img_embed_weight[:, self.out_channels:self.out_channels*2] = flux.img_embed.weight.clone()
+        self.img_embed.weight = nn.Parameter(img_embed_weight)
+        self.img_embed.bias = nn.Parameter(flux.img_embed.bias.clone())
+
     def forward(
         self,
         img: torch.Tensor,
-        controlnet_cond: torch.Tensor,
+        brushnet_cond: torch.Tensor,
         txt: torch.Tensor = None,
         y: torch.Tensor = None,
         timesteps: torch.LongTensor = None,
@@ -227,11 +223,11 @@ class FluxControlNet(VisionModule):
         conditioning_scale: float = 1.0,
     ):
         """
-        Forward pass for the FluxControlNet model.
+        Forward pass for the FluxBrushNet model.
 
         Args:
             img (torch.Tensor): Input image tensor.
-            controlnet_cond (torch.Tensor): Conditioning tensor for ControlNet.
+            brushnet_cond (torch.Tensor): Conditioning tensor for BrushNet.
             txt (torch.Tensor, optional): Text embedding tensor. Default is None.
             y (torch.Tensor, optional): Vector embedding tensor. Default is None.
             timesteps (torch.LongTensor, optional): Time step tensor. Default is None.
@@ -243,20 +239,9 @@ class FluxControlNet(VisionModule):
         Returns:
             torch.Tensor: The output of the forward pass.
         """
-        hidden_states = self.img_embed(img)
+        brushnet_cond = torch.concat([img, brushnet_cond], 2)
         encoder_hidden_states = self.txt_embed(txt)
-        if self.input_hint_block is not None:
-            controlnet_cond = self.input_hint_block(controlnet_cond)
-            batch_size, channels, height_pw, width_pw = controlnet_cond.shape
-            height = height_pw // self.config.patch_size
-            width = width_pw // self.config.patch_size
-            controlnet_cond = controlnet_cond.reshape(
-                batch_size, channels, height, self.patch_size, width, self.patch_size
-            )
-            controlnet_cond = controlnet_cond.permute(0, 2, 4, 1, 3, 5)
-            controlnet_cond = controlnet_cond.reshape(batch_size, height * width, -1)
-
-        hidden_states = hidden_states + self.controlnet_x_embedder(controlnet_cond)
+        hidden_states = self.img_embed(brushnet_cond)
 
         timesteps = timesteps.to(img.dtype) * 1000
         vec_emb = self.timestep_embedding(timesteps)
@@ -313,12 +298,12 @@ class FluxControlNet(VisionModule):
         return controlnet_double_block_samples, controlnet_single_block_samples
 
 
-class FluxControlnetForwardWrapper(VisionModule):
+class FluxBrushNetForwardWrapper(VisionModule):
     '''
     A wrapper combines flux and flux controlnet forward pass for easier initialization.
     '''
 
-    def __init__(self, flux_config: FluxConfig, flux_controlnet_config: FluxControlNetConfig):
+    def __init__(self, flux_config: FluxConfig, flux_controlnet_config: FluxBrushNetConfig):
         '''
         Create flux and flux controlnet instances by their config.
         '''
@@ -328,14 +313,14 @@ class FluxControlnetForwardWrapper(VisionModule):
         for param in self.flux.parameters():
             param.requires_grad = False
 
-        self.flux_controlnet = FluxControlNet(flux_controlnet_config)
+        self.flux_controlnet = FluxBrushNet(flux_controlnet_config)
         if flux_controlnet_config.load_from_flux_transformer:
             self.flux_controlnet.load_from_flux_transformer(self.flux)
     
     def forward(
             self,
             packed_noisy_model_input,
-            control_image,
+            brushnet_cond,
             prompt_embeds,
             pooled_prompt_embeds,
             text_ids,
@@ -345,7 +330,7 @@ class FluxControlnetForwardWrapper(VisionModule):
         ):
         controlnet_double_block_samples, controlnet_single_block_samples = self.flux_controlnet(
             img=packed_noisy_model_input,
-            controlnet_cond=control_image,
+            brushnet_cond=brushnet_cond,
             txt=prompt_embeds,
             y=pooled_prompt_embeds,
             timesteps=timesteps / 1000,
@@ -367,22 +352,22 @@ class FluxControlnetForwardWrapper(VisionModule):
         return noise_pred
 
 
-class MegatronFluxControlNetModel(MegatronFluxModel):
+class MegatronFluxBrushNetModel(MegatronFluxModel):
     """
     Megatron wrapper for flux controlnet model.
 
     Args:
         flux_params (FluxModelParams): Parameters to configure the Flux model.
-        flux_controlnet_config (FluxControlNetConfig): Configuration specific to the FluxControlNet.
+        flux_controlnet_config (FluxBrushNetConfig): Configuration specific to the FluxBrushNet.
 
     Methods:
         configure_model:
-            Configures the model by wrapping the FluxControlNet with the appropriate layers and settings,
+            Configures the model by wrapping the FluxBrushNet with the appropriate layers and settings,
             configuring the VAE, scheduler, and text encoders.
         data_step:
-            A wrapper around the data-step function specific to FluxControlNet, controlling how data is processed.
+            A wrapper around the data-step function specific to FluxBrushNet, controlling how data is processed.
         forward:
-            Executes a forward pass through FluxControlNet.
+            Executes a forward pass through FluxBrushNet.
         training_step:
             A wrapper step method that calls forward_step with a data batch from data loader.
         forward_step:
@@ -392,7 +377,7 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
             image.
     """
 
-    def __init__(self, flux_params: FluxModelParams, flux_controlnet_config: FluxControlNetConfig):
+    def __init__(self, flux_params: FluxModelParams, flux_controlnet_config: FluxBrushNetConfig):
         super().__init__(flux_params)
         self.flux_controlnet_config = flux_controlnet_config
         self.optim.connect(self)
@@ -402,7 +387,7 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
         Initialize flux and controlnet modules, vae, scheduler, and text encoders with given configs.
         '''
         if not hasattr(self, "module"):
-            self.module = FluxControlnetForwardWrapper(self.config, self.flux_controlnet_config)
+            self.module = FluxBrushNetForwardWrapper(self.config, self.flux_controlnet_config)
 
             self.configure_vae(self.vae_config)
             self.configure_scheduler()
@@ -427,7 +412,10 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
     def forward(self, *args, **kwargs):
         '''
         Calling the controlnet forward pass.
-        '''        
+        '''
+        # # FSDP module -> Bfloat16 module -> ForwardWrapper -> flux controlnet
+        # return self.module.module.module.flux_controlnet(*args, **kwargs)
+        
         # FSDP module -> Bfloat16 module -> ForwardWrapper
         return self.module.module.module(*args, **kwargs)
 
@@ -451,12 +439,51 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
 
         if self.image_precached:
             latents = batch['latents'].cuda(non_blocking=True)
-            control_latents = batch['control_latents'].cuda(non_blocking=True)
+            brushnet_cond = batch['control_latents'].cuda(non_blocking=True)
         else:
             img = batch['images'].cuda(non_blocking=True)
             latents = self.vae.encode(img).to(dtype=self.autocast_dtype)
-            hint = batch['hint'].cuda(non_blocking=True)
-            control_latents = self.vae.encode(hint).to(dtype=self.autocast_dtype)
+            hint = batch['hint'].cuda(non_blocking=True) # b, 3, h, w
+
+            masked_image = img.clone()
+            masked_image[hint >= 0.5] = -1.0 # set outside of object region to -1
+
+            masked_image_latents = self.vae.encode(masked_image).to(dtype=self.autocast_dtype)
+
+            masked_image_latents = self._pack_latents(
+                masked_image_latents,
+                batch_size=masked_image_latents.shape[0],
+                num_channels_latents=masked_image_latents.shape[1],
+                height=masked_image_latents.shape[2],
+                width=masked_image_latents.shape[3],
+            ).transpose(0, 1)
+
+            batch_size, _, height, width = hint.shape
+            # VAE applies 8x compression on images but we must also account for packing which requires
+            # latent height and width to be divisible by 2.
+            height = 2 * int(height) // self.vae_scale_factor
+            width = 2 * int(width) // self.vae_scale_factor
+
+            mask = hint[:, 0, :, :]  # batch_size, 8 * height, 8 * width (mask has not been 8x compressed)
+            mask = mask.view(
+                batch_size, height, self.vae_scale_factor // 2, width, self.vae_scale_factor // 2
+            )  # batch_size, height, 8, width, 8
+            mask = mask.permute(0, 2, 4, 1, 3)  # batch_size, 8, 8, height, width
+            mask = mask.reshape(
+                batch_size, self.vae_scale_factor // 2 * self.vae_scale_factor // 2, height, width
+            )  # batch_size, 8*8, height, width
+
+            # 6. pack the mask:
+            # batch_size, 64, height, width -> batch_size, height//2 * width//2 , 64*2*2
+            mask = self._pack_latents(
+                mask,
+                batch_size,
+                self.vae_scale_factor // 2 * self.vae_scale_factor // 2,
+                height,
+                width,
+            ).transpose(0, 1).to(dtype=self.autocast_dtype)
+
+            brushnet_cond = torch.cat([masked_image_latents, mask], dim=2)
 
         latent_image_ids = self._prepare_latent_image_ids(
             batch_size=latents.shape[0],
@@ -473,14 +500,6 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
             height=latents.shape[2],
             width=latents.shape[3],
         )
-
-        control_image = self._pack_latents(
-            control_latents,
-            batch_size=control_latents.shape[0],
-            num_channels_latents=control_latents.shape[1],
-            height=control_latents.shape[2],
-            width=control_latents.shape[3],
-        ).transpose(0, 1)
 
         batch_size = latents.shape[0]
         noise = torch.randn_like(latents, device=latents.device, dtype=latents.dtype)
@@ -526,7 +545,7 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
         ):
             noise_pred = self.forward(
                 packed_noisy_model_input=packed_noisy_model_input,
-                control_image=control_image,
+                brushnet_cond=brushnet_cond,
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
                 timesteps=timesteps,
@@ -546,17 +565,17 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
         Saves the inference results together with the hint image to log folder.
         '''
         logging.info("Start validation step")
-        from nemo.collections.diffusion.models.flux.pipeline import FluxControlNetInferencePipeline
+        from nemo.collections.diffusion.models.flux.pipeline import FluxBrushNetInferencePipeline
 
-        pipe = FluxControlNetInferencePipeline(
+        pipe = FluxBrushNetInferencePipeline(
             params=self.params,
-            contorlnet_config=self.flux_controlnet_config,
+            brushnet_config=self.flux_controlnet_config,
             flux=self.module.module.module.flux,
             vae=self.vae,
             t5=self.t5,
             clip=self.clip,
             scheduler_steps=self.params.scheduler_steps,
-            flux_controlnet=self.module.module.module.flux_controlnet,
+            flux_brushnet=self.module.module.module.flux_controlnet,
         )
 
         if self.image_precached and self.text_precached:
@@ -565,7 +584,7 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
             prompt_embeds = batch['prompt_embeds'].cuda(non_blocking=True).transpose(0, 1)
             pooled_prompt_embeds = batch['pooled_prompt_embeds'].cuda(non_blocking=True)
             log_images = pipe(
-                latents=latents,
+                # latents=latents,
                 control_image=control_latents,
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
@@ -591,7 +610,7 @@ class MegatronFluxControlNetModel(MegatronFluxModel):
                 width=img.shape[3],
                 num_inference_steps=30,
                 num_images_per_prompt=1,
-                guidance_scale=7.0,
+                guidance_scale=3.5,
                 dtype=self.autocast_dtype,
                 save_to_disk=False,
             )

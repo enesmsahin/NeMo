@@ -15,6 +15,11 @@
 import random
 from dataclasses import dataclass
 from typing import Any, List, Optional
+import io
+import json
+import math
+import cv2
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -22,9 +27,11 @@ from einops import rearrange
 from megatron.energon import DefaultTaskEncoder, Sample, SkipSample
 from megatron.energon.task_encoder.base import stateless
 from megatron.energon.task_encoder.cooking import Cooker, basic_sample_keys
+from torchvision import transforms
 
 from nemo.lightning.io.mixin import IOMixin
 from nemo.utils.sequence_packing_utils import first_fit_decreasing
+from PIL import Image, ImageOps
 
 
 @dataclass
@@ -476,3 +483,159 @@ class RawImageDiffusionTaskEncoder(DefaultTaskEncoder, IOMixin):
         # Cooker(cook),
         Cooker(cook_raw_iamges),
     ]
+
+
+def cook_image_masks_with_precached_captions(sample: dict) -> dict:
+
+    return dict(
+        **basic_sample_keys(sample),
+        image=sample['jpg'],
+        mask=sample['single_mask'],
+        caption=sample['caption'],
+        text_ids=sample['text_ids'],
+        prompt_embeds=sample['prompt_embeds'],
+        pooled_prompt_embeds=sample['pooled_prompt_embeds'],
+        new_caption=sample['new_caption'],
+        aesthetic_score=sample['aesthetic_score'],
+    )
+
+
+class PrecachedCaptionWithImageMaskTaskEncoder(DefaultTaskEncoder, IOMixin):
+    '''
+    Dummy task encoder takes raw image input on CrudeDataset.
+    '''
+
+    cookers = [
+        # Cooker(cook),
+        Cooker(cook_image_masks_with_precached_captions),
+    ]
+
+    def __init__(
+            self,
+            height: int = 1024,
+            width: int = 1024,
+            do_cropping: bool = True,
+            target_resolutions: list[tuple[int, int]] | None = None,
+    ):
+        super().__init__()
+        self.new_height = height
+        self.new_width = width
+        self.do_cropping = do_cropping
+        
+        self.target_resolutions = target_resolutions # (w, h)
+        if self.target_resolutions is None:
+            self.target_resolutions = [(1536, 640), (1600, 640), (1408, 704), (1472, 704), (1280, 768), (1344, 768), (1216, 832), (1152, 896), (1088, 960), (1024, 1024), (960, 1088), (896, 1152), (832, 1216), (768, 1280), (768, 1344), (704, 1408), (704, 1472), (640, 1536), (640, 1600)]
+        
+        self.aspect_ratios = [bucket[0] / bucket[1] for bucket in self.target_resolutions]
+
+    @stateless(restore_seeds=True)
+    def encode_sample(self, sample: dict) -> dict:
+        image = sample['image']
+        mask = json.loads(sample['mask'])
+        text_ids = torch.load(io.BytesIO(sample['text_ids']), map_location=torch.device('cpu'))
+        pooled_prompt_embeds = torch.load(io.BytesIO(sample['pooled_prompt_embeds']), map_location=torch.device('cpu'))
+        prompt_embeds = torch.load(io.BytesIO(sample['prompt_embeds']), map_location=torch.device('cpu'))
+        new_caption = sample['new_caption'].decode("utf-8")
+        caption = sample['caption'].decode("utf-8")
+
+        width, height = image.size
+        mask = Image.fromarray(self.decode_mask(mask, height, width))
+
+        # Find the index of the closest aspect ratio to the aspect ratio of the current image
+        asp_ratio = width / height
+        closest_idx = min(range(len(self.aspect_ratios)), key=lambda i: abs(self.aspect_ratios[i] - asp_ratio))
+        
+        target_aspect = self.aspect_ratios[closest_idx]
+        target_w, target_h = self.target_resolutions[closest_idx]
+
+        # Resize such that the image is greater than or equal to the bucket in both dimensions
+        if asp_ratio > target_aspect:
+            new_h = target_h
+            new_w = int(math.ceil(asp_ratio * new_h))
+        else:
+            new_w = target_w
+            new_h = int(math.ceil(new_w / asp_ratio))
+
+        image = image.resize((new_w, new_h), resample=Image.Resampling.BICUBIC)
+        mask = mask.resize((new_w, new_h), resample=Image.Resampling.BICUBIC)
+
+        if self.do_cropping:
+            image, mask = self.random_crop_with_mask(image, mask, (target_h, target_w))
+
+        mask = ImageOps.invert(mask).convert('RGB')
+
+        to_tensor = transforms.ToTensor()
+        image = transforms.Normalize([0.5], [0.5])(to_tensor(image))
+        mask = to_tensor(mask)
+
+
+        return dict(
+            images=image,
+            hint=mask,
+            text_ids=text_ids,
+            pooled_prompt_embeds=pooled_prompt_embeds,
+            prompt_embeds=prompt_embeds,
+            txt=new_caption,
+            caption=caption)
+
+    def decode_mask(self, mask:list, height: int, width: int):
+        mask = np.array(mask)
+        starts, lengths = [np.asarray(x, dtype=int) for x in (mask[0:][::2], mask[1:][::2])]
+        starts -= 1
+        ends = starts + lengths
+        img = np.zeros(height*width, dtype=np.uint8)
+        for lo, hi in zip(starts, ends):
+            img[lo:hi] = 1
+        return np.clip(img.reshape((height, width), order='F') * 255, 0, 255)
+    
+    def random_crop_with_mask(self, image: Image.Image, mask: Image.Image, crop_size: tuple[int, int]):
+        """
+        Randomly crops an image and mask pair such that the object in the mask is entirely within the cropped region.
+
+        Args:
+            image (PIL.Image.Image): The input image to be cropped.
+            mask (PIL.Image.Image): The binary mask corresponding to the image.
+            crop_size (tuple[int, int]): The desired crop size (height, width).
+
+        Returns:
+            cropped_image (PIL.Image.Image): The cropped image.
+            cropped_mask (PIL.Image.Image): The cropped mask.
+        """
+        image = np.array(image)
+        mask = np.array(mask)
+
+        # Ensure the crop size is not larger than the input size
+        assert image.shape[:2] >= crop_size, "Crop size must be smaller than the image size."
+
+        crop_h, crop_w = crop_size
+        img_h, img_w = image.shape[:2]
+
+        # Find the bounding box of the object in the mask
+        x_min, y_min, obj_width, obj_height = cv2.boundingRect(mask)
+        x_max = x_min + obj_width - 1
+        y_max = y_min + obj_height - 1
+
+        # Ensure the bounding box fits within the crop
+        crop_y_min = max(0, y_max - crop_h + 1)
+        crop_x_min = max(0, x_max - crop_w + 1)
+        crop_y_max = min(y_min, img_h - crop_h)
+        crop_x_max = min(x_min, img_w - crop_w)
+        
+        if not (crop_y_max >= crop_y_min and crop_x_max >= crop_x_min):
+            resized_image = Image.fromarray(image).resize((crop_w, crop_h), resample=Image.Resampling.BICUBIC)
+            resized_mask = Image.fromarray(mask).resize((crop_w, crop_h), resample=Image.Resampling.BICUBIC)
+
+            return resized_image, resized_mask
+
+        # Randomly select a valid crop position
+        top = np.random.randint(crop_y_min, crop_y_max + 1)
+        left = np.random.randint(crop_x_min, crop_x_max + 1)
+
+        # Perform the cropping
+        cropped_image = image[top:top + crop_h, left:left + crop_w]
+        cropped_mask = mask[top:top + crop_h, left:left + crop_w]
+
+        cropped_image = Image.fromarray(cropped_image)
+        cropped_mask = Image.fromarray(cropped_mask)
+
+        return cropped_image, cropped_mask
