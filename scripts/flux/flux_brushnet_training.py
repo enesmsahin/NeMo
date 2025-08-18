@@ -76,6 +76,9 @@ def brushnet_datamodule(dataset_dir) -> pl.LightningDataModule:
         seq_length=4096,
         task_encoder=run.Config(
             PrecachedCaptionWithImageMaskTaskEncoder,
+            height=512,
+            width=512,
+            target_resolutions=[(512,512)],
         ),
         micro_batch_size=1,
         global_batch_size=8,
@@ -183,8 +186,8 @@ def datamodule_test(tp=2, devices=8) -> run.Partial:
         AutoEncoderConfig, ch_mult=[1, 2, 4, 4], attn_resolutions=[]
     )
     recipe.model.flux_params.device = 'cuda'
-    # recipe.model.flux_params.flux_config = run.Config(FluxConfig, ckpt_path='/workspace/weights/flux_dist/weights/', load_dist_ckpt=True,  gradient_accumulation_fusion=False, guidance_embed=True,)
-    recipe.model.flux_params.flux_config = run.Config(FluxConfig, gradient_accumulation_fusion=False, guidance_embed=True,)
+    recipe.model.flux_params.flux_config = run.Config(FluxConfig, ckpt_path='/workspace/weights/flux_dist/weights/', load_dist_ckpt=True,  gradient_accumulation_fusion=False, guidance_embed=True,)
+    # recipe.model.flux_params.flux_config = run.Config(FluxConfig, gradient_accumulation_fusion=False, guidance_embed=True,)
     recipe.model.flux_controlnet_config.num_single_layers = 38
     recipe.model.flux_controlnet_config.num_joint_layers = 19
     
@@ -200,4 +203,6 @@ def datamodule_test(tp=2, devices=8) -> run.Partial:
 
 
 if __name__ == "__main__":
-    run.cli.main(llm.train, default_factory=datamodule_test)
+    # run.cli.main(llm.train, default_factory=datamodule_test)
+    recipe = datamodule_test()
+    run.run(recipe)
