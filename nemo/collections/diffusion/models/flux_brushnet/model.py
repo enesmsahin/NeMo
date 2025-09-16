@@ -15,6 +15,7 @@
 from dataclasses import dataclass
 from typing import Callable
 
+import random
 import torch
 import torch.nn as nn
 from megatron.core.models.common.vision_module.vision_module import VisionModule
@@ -97,6 +98,7 @@ class FluxBrushNetConfig(TransformerConfig, io.IOMixin):
 
     load_from_flux_transformer: bool = True
     guidance_scale: float = 3.5
+    training_guidance_scale_ranges: list[float, float] = [1,7]
 
     data_step_fn: Callable = flux_controlnet_data_step
 
@@ -520,10 +522,12 @@ class MegatronFluxBrushNetModel(MegatronFluxModel):
         packed_noisy_model_input = (1.0 - sigma) * latents + sigma * noise
         packed_noisy_model_input = packed_noisy_model_input.transpose(0, 1)
 
+        guidance_scale = random.uniform(self.config.training_guidance_scale_ranges[0], self.config.training_guidance_scale_ranges[1])
+
         if self.config.guidance_embed:
             guidance_vec = torch.full(
                 (packed_noisy_model_input.shape[1],),
-                self.config.guidance_scale,
+                guidance_scale,
                 device=latents.device,
                 dtype=latents.dtype,
             )
