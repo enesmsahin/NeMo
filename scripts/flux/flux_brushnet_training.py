@@ -76,8 +76,6 @@ def brushnet_datamodule(dataset_dir) -> pl.LightningDataModule:
         seq_length=4096,
         task_encoder=run.Config(
             PrecachedCaptionWithImageMaskTaskEncoder,
-            height=512,
-            width=512,
             target_resolutions=[(512,512)],
         ),
         micro_batch_size=1,

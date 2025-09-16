@@ -31,7 +31,7 @@ from torchvision import transforms
 
 from nemo.lightning.io.mixin import IOMixin
 from nemo.utils.sequence_packing_utils import first_fit_decreasing
-from PIL import Image, ImageOps
+from PIL import Image, ImageOps, ImageDraw
 
 
 @dataclass
@@ -511,27 +511,48 @@ class PrecachedCaptionWithImageMaskTaskEncoder(DefaultTaskEncoder, IOMixin):
     ]
 
     def __init__(
-            self,
-            height: int = 1024,
-            width: int = 1024,
-            do_cropping: bool = True,
-            target_resolutions: list[tuple[int, int]] | None = None,
+        self,
+        do_cropping: bool = True,
+        target_resolutions: list[tuple[int, int]] | None = None,
+        p_outpainting_mask: float = 0.5,
+        p_empty_prompts: float = 0.15,
+        seed: int = 42,
     ):
         super().__init__()
-        self.new_height = height
-        self.new_width = width
         self.do_cropping = do_cropping
         
         self.target_resolutions = target_resolutions # (w, h)
         if self.target_resolutions is None:
-            self.target_resolutions = [(1536, 640), (1600, 640), (1408, 704), (1472, 704), (1280, 768), (1344, 768), (1216, 832), (1152, 896), (1088, 960), (1024, 1024), (960, 1088), (896, 1152), (832, 1216), (768, 1280), (768, 1344), (704, 1408), (704, 1472), (640, 1536), (640, 1600)]
+            self.target_resolutions = [
+                (672, 1568),
+                (688, 1504),
+                (720, 1456),
+                (752, 1392),
+                (800, 1328),
+                (832, 1248),
+                (880, 1184),
+                (944, 1104),
+                (1024, 1024),
+                (1104, 944),
+                (1184, 880),
+                (1248, 832),
+                (1328, 800),
+                (1392, 752),
+                (1456, 720),
+                (1504, 688),
+                (1568, 672),
+            ]
         
         self.aspect_ratios = [bucket[0] / bucket[1] for bucket in self.target_resolutions]
+        self.p_outpainting_mask = p_outpainting_mask
+        self.p_empty_prompts = p_empty_prompts
+
+        random.seed(seed)
+        np.random.seed(seed)
 
     @stateless(restore_seeds=True)
     def encode_sample(self, sample: dict) -> dict:
         image = sample['image']
-        mask = json.loads(sample['mask'])
         text_ids = torch.load(io.BytesIO(sample['text_ids']), map_location=torch.device('cpu'))
         pooled_prompt_embeds = torch.load(io.BytesIO(sample['pooled_prompt_embeds']), map_location=torch.device('cpu'))
         prompt_embeds = torch.load(io.BytesIO(sample['prompt_embeds']), map_location=torch.device('cpu'))
@@ -539,7 +560,13 @@ class PrecachedCaptionWithImageMaskTaskEncoder(DefaultTaskEncoder, IOMixin):
         caption = sample['caption'].decode("utf-8")
 
         width, height = image.size
-        mask = Image.fromarray(self.decode_mask(mask, height, width))
+
+        if random.random() < self.p_outpainting_mask:
+            mask = self.create_outpainting_mask(height, width)
+        else:
+            mask = self.random_brush_gen(height, width)
+
+        mask = Image.fromarray(mask)
 
         # Find the index of the closest aspect ratio to the aspect ratio of the current image
         asp_ratio = width / height
@@ -568,6 +595,9 @@ class PrecachedCaptionWithImageMaskTaskEncoder(DefaultTaskEncoder, IOMixin):
         image = transforms.Normalize([0.5], [0.5])(to_tensor(image))
         mask = to_tensor(mask)
 
+        if random.random() < self.p_empty_prompts:
+            prompt_embeds.zero_()
+            pooled_prompt_embeds.zero_()
 
         return dict(
             images=image,
@@ -587,6 +617,130 @@ class PrecachedCaptionWithImageMaskTaskEncoder(DefaultTaskEncoder, IOMixin):
         for lo, hi in zip(starts, ends):
             img[lo:hi] = 1
         return np.clip(img.reshape((height, width), order='F') * 255, 0, 255)
+
+    def create_outpainting_mask(
+        self,
+        height: int,
+        width: int,
+        min_percentage: float = 0.1,
+        max_percentage: float = 0.6,
+    ) -> np.ndarray:
+        """
+        Generates a random outpainting mask for a given image size.
+
+        The mask is black in the center and has white paddings 
+        on two opposite sides (either top/bottom or left/right).
+        The direction and size of the padding are randomized based on the
+        provided percentage range.
+
+        Args:
+            width (int): The width of the mask.
+            height (int): The height of the mask.
+            min_percentage (float): The minimum percentage (0.0 to 1.0) of the
+                                    relevant dimension to use for padding.
+            max_percentage (float): The maximum percentage (0.0 to 1.0) of the
+                                    relevant dimension to use for padding.
+
+        Returns:
+            np.ndarray: A numpy array of shape (height, width) and dtype uint8,
+                        representing the outpainting mask.
+        """
+        # Ensure percentages are within a valid range
+        min_percentage = max(0.0, min_percentage)
+        max_percentage = min(1.0, max_percentage)
+
+        # Create a black mask (value 0) with the target dimensions.
+        mask = np.zeros((height, width), dtype=np.uint8)
+
+        # Randomly choose the outpainting direction
+        direction = random.choice(['horizontal', 'vertical'])
+
+        # Randomly sample the padding percentage from the given range
+        padding_percentage = random.uniform(min_percentage, max_percentage)
+
+        if direction == 'horizontal':
+            # Outpaint on the left and right sides
+            total_padding_width = int(width * padding_percentage)
+            
+            padding_left = total_padding_width // 2
+            padding_right = total_padding_width - padding_left
+
+            if padding_left > 0:
+                mask[:, :padding_left] = 255
+            if padding_right > 0:
+                mask[:, -padding_right:] = 255
+        
+        else: # direction == 'vertical'
+            # Outpaint on the top and bottom sides
+            total_padding_height = int(height * padding_percentage)
+
+            padding_top = total_padding_height // 2
+            padding_bottom = total_padding_height - padding_top
+
+            if padding_top > 0:
+                mask[:padding_top, :] = 255
+            if padding_bottom > 0:
+                mask[-padding_bottom:, :] = 255
+
+        return mask
+
+    def random_brush_gen(
+        self,
+        h,
+        w,
+        max_starting_points = 3,
+        min_num_vertex = 1,
+        max_num_vertex = 6,
+        mean_angle = 5,
+        angle_range = 15,
+        min_width = 80,
+        max_width = 250,
+        radius_divider = 8,
+    ):
+        mean_angle = 2 * math.pi / mean_angle
+        angle_range = 2 * math.pi / angle_range
+        H, W = h, w
+        average_radius = math.sqrt(H*H+W*W) / radius_divider
+        mask = Image.new('L', (W, H), 0)
+        num_starting_points = np.random.randint(1, max_starting_points + 1)
+        for _ in range(num_starting_points):
+            num_vertex = np.random.randint(min_num_vertex, max_num_vertex)
+            angle_min = mean_angle - np.random.uniform(0, angle_range)
+            angle_max = mean_angle + np.random.uniform(0, angle_range)
+            angles = []
+            vertex = []
+            for i in range(num_vertex):
+                if i % 2 == 0:
+                    angles.append(2*math.pi - np.random.uniform(angle_min, angle_max))
+                else:
+                    angles.append(np.random.uniform(angle_min, angle_max))
+
+            w, h = mask.size
+            vertex.append((int(np.random.randint(0, w)), int(np.random.randint(0, h))))
+            for i in range(num_vertex):
+                r = np.clip(
+                    np.random.normal(loc=average_radius, scale=average_radius//2),
+                    0, 2*average_radius)
+                new_x = np.clip(vertex[-1][0] + r * math.cos(angles[i]), 0, w)
+                new_y = np.clip(vertex[-1][1] + r * math.sin(angles[i]), 0, h)
+                vertex.append((int(new_x), int(new_y)))
+
+            draw = ImageDraw.Draw(mask)
+            width = int(np.random.uniform(min_width, max_width))
+            draw.line(vertex, fill=1, width=width)
+            for v in vertex:
+                draw.ellipse((v[0] - width//2,
+                            v[1] - width//2,
+                            v[0] + width//2,
+                            v[1] + width//2),
+                            fill=1)
+            if np.random.random() > 0.5:
+                mask = mask.transpose(Image.FLIP_LEFT_RIGHT)
+            if np.random.random() > 0.5:
+                mask = mask.transpose(Image.FLIP_TOP_BOTTOM)
+        mask = np.asarray(mask, np.uint8)
+
+        return np.clip((mask * 255).astype(np.uint8), 0, 255)
     
     def random_crop_with_mask(self, image: Image.Image, mask: Image.Image, crop_size: tuple[int, int]):
         """
